@@ -1,133 +1,145 @@
+# flake8: noqa: E501
 import os
+import gzip
 import json
 import pickle
-import gzip
-import glob
+
 import pandas as pd
 
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.decomposition import PCA
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.neural_network import MLPClassifier
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
-from sklearn.decomposition import PCA
-from sklearn.model_selection import GridSearchCV, StratifiedKFold
-from sklearn.metrics import balanced_accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, \
-    make_scorer
-from sklearn.compose import ColumnTransformer
+from sklearn.metrics import (
+    precision_score, recall_score, f1_score,
+    balanced_accuracy_score, confusion_matrix
+)
+from sklearn.model_selection import GridSearchCV
 
 
-def load_train_test_data():
-    train_df = pd.read_csv("../files/input/train_data.csv.zip", compression="zip")
-    test_df = pd.read_csv("../files/input/test_data.csv.zip", compression="zip")
-    return train_df, test_df
+def preprocess_credit_data(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.drop(columns='ID', inplace=True)
+    df.rename(columns={'default payment next month': 'default'}, inplace=True)
+    df.dropna(inplace=True)
+    df = df[(df['EDUCATION'] != 0) & (df['MARRIAGE'] != 0)]
+    df.loc[df['EDUCATION'] > 4, 'EDUCATION'] = 4
+    return df
 
 
-def clean_dataset(df):
-    df = df.rename(columns={'default payment next month': 'default'})
-    df.drop(columns=['ID'], inplace=True)
-    df = df[(df['MARRIAGE'] != 0) & (df['EDUCATION'] != 0)]
-    df['EDUCATION'] = df['EDUCATION'].apply(lambda x: 4 if x > 4 else x)
-    return df.dropna()
+def split_features_labels(train_df: pd.DataFrame, test_df: pd.DataFrame):
+    X_train = train_df.drop(columns="default")
+    y_train = train_df["default"]
+    X_test = test_df.drop(columns="default")
+    y_test = test_df["default"]
+    return X_train, y_train, X_test, y_test
 
 
-def split_features_labels(df):
-    return df.drop(columns=['default']), df['default']
+def build_model_pipeline():
+    categorical_features = ['SEX', 'EDUCATION', 'MARRIAGE']
+    numeric_features = [
+        "LIMIT_BAL", "AGE", "PAY_0", "PAY_2", "PAY_3", "PAY_4",
+        "PAY_5", "PAY_6", "BILL_AMT1", "BILL_AMT2", "BILL_AMT3",
+        "BILL_AMT4", "BILL_AMT5", "BILL_AMT6", "PAY_AMT1", "PAY_AMT2",
+        "PAY_AMT3", "PAY_AMT4", "PAY_AMT5", "PAY_AMT6"
+    ]
 
-
-def build_classification_pipeline(feature_columns):
-    categorical = ["SEX", "EDUCATION", "MARRIAGE"]
-    numerical = list(set(feature_columns) - set(categorical))
-
-    preprocessing = ColumnTransformer(transformers=[
-        ('cat', OneHotEncoder(handle_unknown='ignore'), categorical),
-        ('num', MinMaxScaler(), numerical),
+    transformer = ColumnTransformer([
+        ("categorical", OneHotEncoder(handle_unknown="ignore"), categorical_features),
+        ("numeric", StandardScaler(), numeric_features)
     ])
 
-    pipeline = Pipeline([
-        ('preprocessing', preprocessing),
-        ('pca', PCA()),
-        ('feature_selection', SelectKBest(score_func=f_classif)),
-        ('mlp', MLPClassifier(random_state=12345, max_iter=1000))
+    return Pipeline([
+        ("preprocessing", transformer),
+        ("feature_selection", SelectKBest(score_func=f_classif)),
+        ("dim_reduction", PCA()),
+        ("classifier", MLPClassifier(max_iter=15000, random_state=17)),
     ])
 
-    return pipeline
 
-
-def perform_grid_search(pipeline, x_train, y_train):
+def define_grid_search(pipeline: Pipeline) -> GridSearchCV:
     param_grid = {
-        "pca__n_components": [20, x_train.shape[1] - 2],
-        "feature_selection__k": [12],
-        "mlp__hidden_layer_sizes": [(50,), (100,)],
-        "mlp__alpha": [0.0001, 0.001],
+        'dim_reduction__n_components': [None],
+        'feature_selection__k': [20],
+        'classifier__hidden_layer_sizes': [(50, 30, 40, 60)],
+        'classifier__alpha': [0.26],
+        'classifier__learning_rate_init': [0.001],
     }
 
-    scorer = make_scorer(balanced_accuracy_score)
-    cv = StratifiedKFold(n_splits=10)
+    return GridSearchCV(
+        estimator=pipeline,
+        param_grid=param_grid,
+        cv=10,
+        scoring='balanced_accuracy',
+        n_jobs=-1,
+        verbose=0
+    )
 
-    grid_search = GridSearchCV(pipeline, param_grid, scoring=scorer, cv=cv, n_jobs=-1)
-    grid_search.fit(x_train, y_train)
-    return grid_search
 
-
-def calculate_evaluation_metrics(dataset_name, y_true, y_pred):
-    return {
+def evaluate_model(model, X, y, dataset_name: str):
+    predictions = model.predict(X)
+    metrics = {
         "type": "metrics",
         "dataset": dataset_name,
-        "precision": precision_score(y_true, y_pred, zero_division=0),
-        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
-        "recall": recall_score(y_true, y_pred, zero_division=0),
-        "f1_score": f1_score(y_true, y_pred, zero_division=0)
+        "precision": round(precision_score(y, predictions), 4),
+        "balanced_accuracy": round(balanced_accuracy_score(y, predictions), 4),
+        "recall": round(recall_score(y, predictions), 4),
+        "f1_score": round(f1_score(y, predictions), 4)
     }
+    return predictions, metrics
 
 
-def generate_confusion_dict(dataset_name, y_true, y_pred):
-    cm = confusion_matrix(y_true, y_pred)
+def create_confusion_report(y_true, y_pred, dataset_name: str):
+    matrix = confusion_matrix(y_true, y_pred)
     return {
         "type": "cm_matrix",
         "dataset": dataset_name,
-        "true_0": {"predicted_0": int(cm[0][0]), "predicted_1": int(cm[0][1])},
-        "true_1": {"predicted_0": int(cm[1][0]), "predicted_1": int(cm[1][1])}
+        "true_0": {"predicted_0": int(matrix[0][0]), "predicted_1": int(matrix[0][1])},
+        "true_1": {"predicted_0": int(matrix[1][0]), "predicted_1": int(matrix[1][1])}
     }
 
 
-def save_model_to_gzip(estimator, output_path):
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with gzip.open(output_path, "wb") as f:
-        pickle.dump(estimator, f)
+def save_pickle_gz(obj, path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with gzip.open(path, 'wb') as f:
+        pickle.dump(obj, f)
 
 
-def write_metrics_to_json(metrics_list, output_path):
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        for metrics in metrics_list:
-            f.write(json.dumps(metrics) + "\n")
+def save_jsonl(records: list[dict], path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        for record in records:
+            f.write(json.dumps(record) + '\n')
 
 
-def run_model_pipeline():
-    train_df, test_df = load_train_test_data()
-    train_df = clean_dataset(train_df)
-    test_df = clean_dataset(test_df)
+def main():
+    train_df = pd.read_csv("../files/input/train_data.csv.zip")
+    test_df = pd.read_csv("../files/input/test_data.csv.zip")
 
-    x_train, y_train = split_features_labels(train_df)
-    x_test, y_test = split_features_labels(test_df)
+    train_df = preprocess_credit_data(train_df)
+    test_df = preprocess_credit_data(test_df)
 
-    pipeline = build_classification_pipeline(x_train.columns)
-    model = perform_grid_search(pipeline, x_train, y_train)
+    X_train, y_train, X_test, y_test = split_features_labels(train_df, test_df)
 
-    save_model_to_gzip(model, "../files/models/model.pkl.gz")
+    base_pipeline = build_model_pipeline()
+    search_model = define_grid_search(base_pipeline)
+    search_model.fit(X_train, y_train)
 
-    y_train_pred = model.predict(x_train)
-    y_test_pred = model.predict(x_test)
+    save_pickle_gz(search_model, '../files/models/model.pkl.gz')
 
-    metrics = [
-        calculate_evaluation_metrics("train", y_train, y_train_pred),
-        calculate_evaluation_metrics("test", y_test, y_test_pred),
-        generate_confusion_dict("train", y_train, y_train_pred),
-        generate_confusion_dict("test", y_test, y_test_pred),
-    ]
+    y_pred_train, train_metrics = evaluate_model(search_model, X_train, y_train, "train")
+    y_pred_test, test_metrics = evaluate_model(search_model, X_test, y_test, "test")
 
-    write_metrics_to_json(metrics, "../files/output/metrics.json")
+    train_cm = create_confusion_report(y_train, y_pred_train, 'train')
+    test_cm = create_confusion_report(y_test, y_pred_test, 'test')
+
+    save_jsonl(
+        [train_metrics, test_metrics, train_cm, test_cm],
+        '../files/output/metrics.json'
+    )
 
 
 if __name__ == "__main__":
-    run_model_pipeline()
+    main()
